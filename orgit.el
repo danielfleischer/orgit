@@ -45,11 +45,14 @@
 ;; Format
 ;; ------
 
-;; The three link types defined here take these forms:
+;; The four link types defined here take these forms:
 ;;
 ;;    orgit:/path/to/repo/            links to a `magit-status' buffer
 ;;    orgit-rev:/path/to/repo/::REV   links to a `magit-revision' buffer
 ;;    orgit-log:/path/to/repo/::ARGS  links to a `magit-log' buffer
+;;    orgit-blob:/path/to/repo/::REV:path/to/blob[#N[-M]]
+;;      links to a file- or blob-visiting buffer,
+;;      optionally at a certain line or span of lines
 
 ;; Before v1.3.0 only the first revision was stored in `orgit-log'
 ;; links, and all other revisions were discarded.  All other arguments
@@ -121,27 +124,33 @@
   `(("github.com[:/]\\(.+?\\)\\(?:\\.git\\)?$"
      "https://github.com/%n"
      "https://github.com/%n/commits/%r"
-     "https://github.com/%n/commit/%r")
+     "https://github.com/%n/commit/%r"
+     "https://github.com/%n/blob/%r/%p%L")
     ("gitlab.com[:/]\\(.+?\\)\\(?:\\.git\\)?$"
      "https://gitlab.com/%n"
      "https://gitlab.com/%n/commits/%r"
-     "https://gitlab.com/%n/commit/%r")
+     "https://gitlab.com/%n/commit/%r"
+     "https://gitlab.com/%n/-/blob/%r/%p%l")
     ("git.sr.ht[:/]\\(.+?\\)\\(?:\\.git\\)?$"
      "https://git.sr.ht/%n"
      "https://git.sr.ht/%n/log/%r"
-     "https://git.sr.ht/%n/commit/%r")
+     "https://git.sr.ht/%n/commit/%r"
+     "https://git.sr.ht/%n/tree/%r/%p%l")
     ("bitbucket.org[:/]\\(.+?\\)\\(?:\\.git\\)?$"
      "https://bitbucket.org/%n"
      "https://bitbucket.org/%n/commits/branch/%r"
-     "https://bitbucket.org/%n/commits/%r")
+     "https://bitbucket.org/%n/commits/%r"
+     "https://bitbucket.org/%n/src/%r/%p%N")
     ("code.orgmode.org[:/]\\(.+\\)$"
      "https://code.orgmode.org/cgit.cgi/%n"
      "https://code.orgmode.org/cgit.cgi/%n/commits/%r"
-     "https://code.orgmode.org/cgit.cgi/%n/commit/%r")
+     "https://code.orgmode.org/cgit.cgi/%n/commit/%r"
+     "https://code.orgmode.org/cgit.cgi/%n/src/%r/%p%L")
     ("git.kernel.org/pub/scm[:/]\\(.+\\)$"
      "https://git.kernel.org/cgit/%n"
      "https://git.kernel.org/cgit/%n/log/?h=%r"
-     "https://git.kernel.org/cgit/%n/commit/?id=%r"))
+     "https://git.kernel.org/cgit/%n/commit/?id=%r"
+     "https://git.kernel.org/cgit/%n/tree/?id=%r%p%n"))
   "Alist used to translate Git urls to web urls when exporting links.
 
 Each entry has the form (REMOTE-REGEXP STATUS LOG REVISION).  If
@@ -165,7 +174,8 @@ are defined then `orgit-remote' and `orgit.remote' have no effect."
                        (regexp :tag "Remote regexp")
                        (string :tag "Status format")
                        (string :tag "Log format" :format "%{%t%}:    %v")
-                       (string :tag "Revision format"))))
+                       (string :tag "Revision format")
+                       (string :tag "Blob format"))))
 
 (defcustom orgit-remote "origin"
   "Default remote used when exporting links.
@@ -398,6 +408,60 @@ store links to the Magit-Revision mode buffers for these commits."
             (abbreviate-file-name default-directory)
             (magit-read-branch-or-commit "Revision"))))
 
+;;; Blob
+
+;;;###autoload
+(eval-after-load 'org
+  '(orgit-link-set-parameters "orgit-blob"
+                              :store    'orgit-blob-store
+                              :follow   'orgit-blob-open
+                              :export   'orgit-blob-export
+                              :complete 'orgit-blob-complete-link))
+
+;;;###autoload
+(defun orgit-blob-store ()
+  (when magit-buffer-revision
+    (let* ((repo (orgit--current-repository))
+           (ref  magit-buffer-refname)
+           (rev  (magit-rev-parse (or magit-buffer-revision
+                                      (magit-get-current-branch)
+                                      "HEAD")))
+           (file (file-relative-name (or magit-buffer-file-name
+                                         buffer-file-name)
+                                     repo)))
+      (org-link-store-props
+       :type        "orgit-blob"
+       :link        (format "orgit-blob:%s::%s/%s"  repo (or ref rev) file)
+       :description (format "%s (magit-blob %s:%s)" repo (or ref rev) file)))))
+
+;;;###autoload
+(defun orgit-blob-open (path)
+  (pcase-let* ((`(,repo ,value) (split-string path "::"))
+               (`(,blob ,path ,beg ,_end) (orgit-blob--split value)))
+    (if t
+        (magit-find-file )
+      (find-file (expand-file-name path repo)))))
+
+;;;###autoload
+(defun orgit-blob-export (path desc format)
+  (orgit-export path desc format "rev" 3))
+
+;;;###autoload
+(defun orgit-blob-complete-link (&optional arg)
+  (let ((default-directory (magit-read-repository arg)))
+    (format "orgit-blob:%s::%s"
+            (abbreviate-file-name default-directory)
+            (magit-read-branch-or-commit "Revision")
+            )))
+
+(defun orgit-blob--split (value)
+  (and (string-match "\\([^/]+\\)/\\([^#]+\\)\
+\\(?:#\\([^-]+\\)\\(?:-\\(.+\\)\\)?\\)?\\'" value)
+       (list (match-string 1 value)
+             (match-string 2 value)
+             (match-string 3 value)
+             (match-string 4 value))))
+
 ;;; Export
 
 (defun orgit-export (path desc format gitvar idx)
@@ -417,12 +481,30 @@ store links to the Magit-Revision mode buffers for these commits."
                                                (lambda (elt)
                                                  (string-match (car elt) url))
                                                orgit-export-alist)))
-                               (format-spec (nth idx format)
-                                            `((?n . ,(match-string 1 url))
-                                              (?r . ,rev)))))))
+                             (orgit--format-url (nth idx format)
+                                                (match-string 1 url)
+                                                rev)))))
             (orgit--format-export link desc format)
           (error "Cannot determine public url for %s" path))
       (error "Cannot determine public remote for %s" default-directory))))
+
+(defun orgit--format-url (format name rev)
+  (if-let ((dest (orgit-blob--split rev)))
+      (pcase-let ((`(,blob ,path ,beg ,end) dest))
+        (format-spec
+         format
+         `((?n . ,name)
+           (?r . ,blob)
+           (?p . ,path)
+           (?l . ,(if beg (if end (format "#L%s-%s" beg end) (format "#L%s" beg)) ""))
+           (?L . ,(if beg (if end (format "#L%s-L%s" beg end) (format "#L%s" beg)) ""))
+           (?n . ,(if beg (format "#n%s" beg) ""))
+           (?N . ,(if beg
+                      (if end (format "#lines%s:%s" beg end) (format "#lines%s" beg))
+                    "")))))
+    (format-spec format
+                 `((?n . ,name)
+                   (?r . ,rev)))))
 
 (defun orgit--format-export (link desc format)
   (pcase format
